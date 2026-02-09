@@ -17,7 +17,7 @@
   - Pod
   - Deployment
   - Service
-  - Ingress
+  - Gateway API
 - Kubernetesはコンテナだけど「コンテナだけ」じゃない
   - ワークロードの管理者、形態は関係ない
   - Reconciliation Loop
@@ -32,8 +32,126 @@
 <https://docs.google.com/presentation/d/1Fva8ZnfZ9gEpYCJ387TUB5aAH7Ydp6UvX-UQNxDWrso/edit?usp=sharing> の90Pから
 
 - Kubernetesを流れる通信
-  - Pod - Service - Pod
-  - 外部 - Ingress - Service - Pod
-  - Pod - 外部
+  - クラスタ内: Pod - Service - Pod
+  - クラスタ外から: 外部 - Ingress - Service (- Pod)
+  - クラスタ外へ: Pod - 外部
 - Kubernetesを構成する部品
 - ネットワークを担当する部品
+  - L2/L3ネットワーク: CNI
+  - L4ロードバランサー: kube-proxy
+  - Ingress通信用 L7LB: Gateway API Controller
+
+## 前提: Linuxのネットワークスタック
+
+- Network Namespace: L1
+  - 一つのハードウェアの上に、(ネットワーク的に)仮想的なマシンを複数置ける
+  - (ネットワーク的な)コンテナの実態
+  - そもそもホストのネットワークもRoot Namespaceに置かれている
+- ip-link: L2/L3
+  - 特にコンテナナットワーキングでは、Namespaceや他のホストとの繋がりを作る役割を担う
+  - Virtual Ethernet
+  - Linux Bridge
+- ip-route: L3
+  - ルーティングテーブルの管理
+  - Linuxをルーターとして扱う
+- netfilter: L4
+  - L4ベースのパケットフィルタリング
+  - NAT (SNAT/DNAT)
+  - ユーザーからの窓口
+    - 昔はiptables
+    - 今はnftablesに移行が進む
+
+## CNI: L2/L3ネットワーク
+
+<https://docs.google.com/presentation/d/1Fva8ZnfZ9gEpYCJ387TUB5aAH7Ydp6UvX-UQNxDWrso/edit?usp=sharing> の104Pから
+
+- CNIはKubernetesだけじゃない、コンテナのネットワークシステム
+  - 余談: CNIは (実質) Kubernetesだけ
+- CNIを構成する要素
+  - CNI仕様
+  - 基盤の要件定義
+  - CNIプラグイン
+
+### CNI仕様
+
+- プラグインが満たすべきユーザーとのインターフェース
+- 定められたCNIの操作方法
+
+### 基盤の要件定義
+
+- 基盤によって定められる、ネットワークが満たすべき要件
+- The Kubernetes network model
+- 要件さえ満たせれば何を使っても良い
+  - CNIの仕組みはどんなネットワーク技術でも受け入れる広い受け皿
+
+### CNIプラグインの実装
+
+それぞれのプラグインのLife of a Packetを紹介
+
+- Flannel
+  - Linux Bridge
+  - VXLANオーバーレイネットワーク
+- Calico
+  - ルーティングテーブル
+  - BGPピアリング
+- Cilium
+  - eBPFプログラム
+  - Tunnelモード / Nativeモード
+- Amazon VPC CNI
+  - VPCのENIを直接割り当てる
+  - ルーティングテーブル
+  - AWS VPCの仕組みでノード間をルーティング
+- GKE Dataplane V2
+  - ノード内はCiliumベース
+  - ノード間はGoogleの基盤ネットワークを利用
+- Coil on Neko
+  - ノード内はCiliumベース
+  - ノード間は、Nekoのネットワークに対してBGPで持っているPodのIPを広報
+
+Pod - 外部 の通信は、netfilterのSNAT (masquerade) で実装されることがほとんど
+
+## L4ロードバランサー: kube-proxy
+
+- Serviceの実態
+  - 複数のPodに対して、L4ロードバランシングを提供
+- やってることはただのDNAT
+  - Serviceに属するPodの中からランダムに一つ選んで、宛先IPを書き換え
+- 実装方式
+  - これまで: デフォルトはiptables
+  - これから: デフォルトがnftablesへ
+
+## Ingress通信用 L7LB: Gateway API Controller
+
+- 外部から受けるHTTPトラフィックの、L7ロードバランサー
+  - Webアプリケーション用に作られた基盤なので、これがあらかじめ考慮されている
+- Gateway APIとGateway API Controller
+  - Gateway APIとしてKubernetesに設定を登録
+  - Gateway API Controllerが設定を読み取り、実際にトラフィックをロードバランス
+- Gateway API Controller
+  - 一般的なHTTPリバースプロキシが、Kubernetesから設定を読み取る機能を備えた物
+  - Kubernetesはデフォルトを提供していない
+  - 代表例: NGINX Gateway Fabric, Envoy Gateway, AWS Load Balancer Controller, Google Kubernetes Engine
+
+### 実装例の紹介
+
+- NGINX Gateway Fabric (OSS/汎用型 代表)
+  - 外から来たトラフィックをNGINXのPodに流し、そこからServiceに流す
+  - Serviceから先はPod-to-Podの通信
+- AWS Load Balancer Controller (ネットワーク基盤特化型 代表)
+  - あらかじめ、全ての割り振り先ルート用の入り口 (NodePort Service) をノードに空けておく
+  - 外から来たトラフィックはAWS ALBを通り、そこから上記割り振り先ごとの入り口に流す
+  - Serviceから先はPod-to-Podの通信
+
+## プラットフォームとの対話を
+
+- 汎用的 ≠ それだけでいい
+  - 見てきた通り、特にCNIやL7LBは、今持っている基盤に合わせるメリットが大きく、デカいプラットフォームでは既に行われている
+  - 自分たちのネットワークの状態に合わせて、最適なものを選ぶ/作ることができる
+- CNIがインターフェースになっているのは、クラウドベンダーが自社のネットワークに合わせて効率の良い処理基盤を組むため
+  - オンプレ環境でネットワークが全部わかるなら、それに効率化するに越したことはない
+- 今日取り扱った部品を「共通言語」にして、プラットフォームチームと対話を
+  - 例えばCNI/L7LBの選定やカスタマイズ、果てには自作など
+
+## まとめ
+
+ネットワークとの「フラっと」な対話で共にスケールする基盤を！
