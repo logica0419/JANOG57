@@ -97,6 +97,9 @@
 - Cilium
   - eBPFプログラム
   - Tunnelモード / Nativeモード
+- これらは OSS だから全部汎用
+- CNIプラグイン自作・改造したいインセンティブ例 (色々)
+- 実際に独自の CNIプラグインを使用している例
 - Amazon VPC CNI
   - VPCのENIを直接割り当てる
   - ルーティングテーブル
