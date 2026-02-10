@@ -1,0 +1,164 @@
+## Kubernetes ネットワークの前提知識メモ
+
+Kubernetes の完全なネットワーク寄りの解釈をここにまとめた。
+
+- 不変条件と前提知識
+  - Podごとに固有のIPがある (Pod IP)
+    - つまり同じeth0/route/neighbor
+    - この前提があるので、アプリは “localhostで協調し、外とはPod IPで通信” という構造になる
+  - Pod間通信は（原則として）NATなしで成立する
+    - つまり任意のPodは、任意の他Podと、そのPod IPを宛先に直接到達できる
+  - NodeはPodを収容し、Node間であってもPod IPで到達できる
+    - CNIが担う。実装としては大きく分けて以下の2種類
+      - ルーティング型（underlayでL3ルーティングを張る）
+      - オーバレイ型（VXLAN等でトンネルを張り、二重ルーティングで運ぶ）
+  - Serviceは「Podの集合に対する安定したL4宛先」を提供する
+    - Pod IPは再スケジュールで変わり得る。そこでServiceが「安定した仮想IP（ClusterIP）＋ポート」を提供し、背後のPod集合へ振り分ける (L4ロードバランシング)
+    - Serviceは“ネットワーク機器”ではなく「到達性の抽象」を作る概念
+      - その具現化がkube-proxy（iptables/ipvs/nftables）やeBPF datapath等であるが、詳細は後述
+  - 外部公開の入口は複数階層に分かれる（L4とL7）
+    - L4 (NodePort/LoadBalancer), L7 (Ingress/Gateway)
+  - ポリシーは宣言され、データプレーンに投影される（NetworkPolicy）
+    - K8sでは通信可否をPodラベル等をキーに宣言できる
+- つまり Kubernetesは PodをIPを持つ単位として扱い、クラスタ全体でPod IPの到達性を保証し、さらにServiceで安定したL4宛先を提供する
+- Kubernetes 内の概念とそれを実現する Linux ネットワーク機能の対応
+  - Node
+    - 実体：ホスト netns
+      - 物理NIC＋仮想IF群
+    - Link：物理NIC、(Podごとの)vethのホスト側、(CNI の実装次第で) bridge やトンネル IF 等
+    - Address：Node IP、(CNIの実装次第で) bridgeのIP やトンネルIFのIP等
+    - Route：Pod CIDR宛の経路、他Node宛の経路、default route
+  - Pod
+    - 実体：1つの netns
+    - Link：Pod内 eth0
+      - CNIが作る。実体はvethのPod側
+    - Route：デフォルト（次ホップはNode側）、クラスタ向けの経路
+  - Service（ClusterIP）
+    - 安定した仮想IP＋ポートを提供し、その背後のPod集合へ負荷分散する
+    - Linux的には「仮想IP（VIP）宛てに来たパケットを、実Pod（Endpoint/EndpointSlice）へ転送する規則集合」
+    - Endpoint / EndpointSlice
+      - このServiceの背後にいるPodのIP:port一覧
+  - CNI
+    - CNIはlink/addr/route（＋必要ならトンネルやbridge）を作ってPod到達性を成立させる
+      - Pod netnsに eth0/Pod IP/route を付与、Node側にveth終端を作成、必要ならbridgeやルートやトンネルIFを設定、必要ならNATやpolicy実装を設定
+    - PodにIPを割り当てるのは CNI プラグイン
+  - kube-proxy
+    - Service リソースを具現化するコンポーネント。「Service（VIP）宛ての通信を、Endpoint (背後のPod) へ分配するルール」をNode上に作る
+    - モード: iptables / ipvs / nftables
+      - iptables モード
+        - Serviceはどこかに仮想NICを作るわけではなく、iptables 上のルールとして実現される
+        - 「宛先がServiceのVIPなら、実Pod（Endpoint）のIPへ書き換える」規則として kube-proxy が iptables のルール列に組み込む
+          - つまりはやっていることは DNAT (=kube-**proxy**)
+        - 規模が大きいとルール探索コストが問題になりやすいため、最近は nftables モードが推奨される
+      - ipvs モード
+        - 各ノードにダミーインターフェース（既定で kube-ipvs0）を用意して、Service IP（ClusterIP等）をそのダミーIFにバインドする
+- 簡略化したフロー
+  - (各 Node の情報 (IP の割り当てや Pod/Service の状態) は何らかの他の仕組みによって協調的に事前に共有されているとして)
+  - Pod → Pod（同一Node）
+    - Pod netns → veth → Node内（L2/L3：CNI方式によりbridgeかroutingかeBPF）→ veth → 相手Pod netns
+  - Pod → Pod（別Node）
+    - Pod → veth → Node（ここで宛先IPが同一Nodeのpod CIDR でないことを知る、ルーティング or トンネル）→ underlay/overlay → 別Node（逆処理）→ veth → Pod
+  - Pod → Service（ClusterIP）
+    - Pod → NodeデータパスでService変換（kube-proxy等）→ 実Podへ転送
+- CNI
+  - Pod 間に NAT なしのネットワーク到達性を実現するために、以下の2つのルートを整備する
+    - Node内（同一NodeでのPod-to-Pod）
+      - veth →（方式により）bridge or L3 routing or eBPF datapath → veth
+      - ここは「Node内の配線方式」の差
+      - 方式の分類
+        - bridge型（L2集約）
+          - Node内にbridgeを作り、各Pod vethを収容してL2でつなぐ。最初に思いつくシンプルな方法
+        - routed型（L3配線）
+          - bridgeを使わず、NodeがL3で各Pod vethへルーティングする。L2をなるべく引きずらず、ルーティング中心で組む (L2 がスケールしにくい問題への対処)
+        - eBPF datapath型
+          - 通常のスタックより手前で、転送やポリシーやService処理を行う設計
+    - Node間（別NodeのPod-to-Pod）
+      - Node出口 →（underlay 直ルーティング or overlay トンネル）→ 別Node入口 → Pod
+      - ここは「クラスタ全体の到達性方式」の差
+      - 方式の分類
+        - ルーティング型（underlay）
+          - 各Nodeが「どのPod CIDRがどのNodeにあるか」をL3で知っていて、通常のIP転送で運ぶ。実現は静的ルートでも良いし、BGP等の動的経路配布でも良い。トンネルは基本不要
+          - 手順
+            - ルーティングを「宛先 Pod CIDR は次ホップ＝相手Node、出口IF＝物理NIC」のように決める
+            - 相手Nodeは受信したIPパケットの宛先が自分の配下 Pod であると分かり、ローカル配送
+          - パケットは常に Pod IP のままネットワークを流れる
+          - スケールは“経路配布”が支配する（静的かBGP等か）
+        - オーバレイ型（VXLAN等）
+          - Node間にトンネルを張って、Pod IP（inner）をNode間通信（outer）で運ぶ
+          - 手順
+            - Nodeは「宛先Pod IPはoverlayで運ぶ」と決める。つまり出力IFがトンネルIFになる
+            - トンネル処理が inner（Pod IP宛てのIPパケット）を包み、outer（Node IP宛ての搬送パケット）を作る
+            - outerは通常のIPとして underlay を流れる。宛先は相手Node
+            - 相手Nodeでouter受信→トンネル終端でデカプセル化→innerが出てくる。そのinnerの宛先Pod IPに従って、Node内方式でvethへ配送される
+          - underlayにはNode間到達性さえあればよく、Pod IPはunderlayに露出しない
+  - CNI の IPAM
+    - CNI は Pod の IPAM も担う
+    - 典型は「NodeごとにPod CIDRを割り当て、そこからPod IPを配る」モデル
+      - これは上記で説明した Node 間の配線方式のルーティング型 ([Linux Network#6989dd470000000000be7eaa]) とも相性が良い
+  - kube-proxy との責務の境界
+    - CNIは主に「Pod IPの到達性（Pod-to-Pod）」を成立させる
+    - 一方、Service の ClusterIP→Endpoint分配は、kube-proxyがNode上にルールを作って実現するのが基本
+    - つまり、CNIとkube-proxyは「Pod宛ての到達性」と「Service宛ての到達性」で主担当が違う。Serviceは別軸（kube-proxy）で、Pod-to-Podとは概念的に切れる
+      - Pod の IPAM は CNI が、Service の IPAM は Kubernetes (control plane) が担う
+        - Service への IP は Node の CIDR ではなくクラスタ内の Service 用IPプール (ServiceCIDR) から切り出される
+      - Q. ServiceIP への配送はどうするのか？
+        - A. Service は「抽象」で、Service の ClustreIP 宛ての通信をどの Pod に流すかはノード上のデータプレーン (netfilter 等) にルール (転送) として具現化されるため、通信を開始した Node を出る前に宛先 ServiceIP はロードバランスした特定の PodIP に変換される
+        - ↑Service は実体として存在しないので、(ノード間で情報共有を行った前提で) ノードを跨いでロードバランスできる
+      - Service を扱う責務
+        - Kubernetes control plane：Service VIP と EndpointSlice（Pod IP:port の集合）を管理
+        - Nodeのデータプレーン：VIP→実Podへの変換を実行（kube-proxy等が規則をプログラム）
+- クラスタへのエンドポイント
+  - L4: Service
+    - type: NodePort
+      - 全ノードの特定ポートを開けて、そのノードに来た通信をServiceへ流す
+      - データパス
+        - 外部クライアント → NodeIP:NodePort（到達したノード）→（Node上でService変換）→ PodIP:targetPort →（Pod-to-Pod）→ Pod
+    - type: LoadBalancer
+      - 外部ロードバランサ（またはそれに相当する仕組み）が、ある外部IPを持ち、そこに来た通信をクラスタに流し込む
+      - 内部的には「外部LB+NodePort Service」
+        - 実質的に外部LBを自分で用意して各ノードのポートに振り分ければ NodePort Service だけで足りるが、それでも type LoadBalancer が用意されているのは 外部LBの確保・設定・ライフサイクルをKubernetes APIに統合するため
+          - LoadBalancer Service を作ると（対応環境では）クラウドのロードバランサが自動作成され、外部IPが払い出され (外部LB)、そのIPがクラスタノードの適切なポートへ送る (NodePort)
+      - データパス
+        - 外部クライアント → クラスタ外LB → NodeIP:NodePort（到達したノード）→（Node上でService変換）→ PodIP:targetPort →（Pod-to-Pod）→ Pod
+  - L7: Ingress
+    - Ingress
+      - HTTP/HTTPS をどう振り分けるか（host/path/TLS等）を宣言するKubernetesリソース
+      - Ingress自体はトラフィックを流さない。ただの宣言
+    - IngressController
+      - Ingress の宣言を読み取り、それを実際に処理するデータプレーン（NGINX、Envoy、HAProxy、クラウドLBのL7機能など）を動かすコントローラ
+      - Ingress Controllerは Service へのプロキシ/ロードバランサ
+      - Ingress Controller はDeployment/DaemonSetで動くPod群
+      - その Pod 群に外部から到達させるために、通常は Ingress Controller 用の Service が別途作られる
+      - データパス
+        - 外部 →（Ingress Controller 実装が公開した入口：LB/NodePort/hostNetwork等）→ Ingress Controller Pod（L7で振り分け）→ バックエンド Service（ClusterIPなど）→ kube-proxy等で Endpoint Podへ
+        - といったような二段L7の振り分け＋L4のService分配になる
+  - L7: Gateway API
+    - Ingress はHTTP を外へ出すための最低限の共通仕様で、現実の高度な機能（ヘッダ一致、重み付け、リトライ、ミラーリング、TLS詳細、TCP/UDP等）はアノテーションにし、後は実装に任せる (実装依存) ことになりがちだった
+    - Gateway API はそこを仕様として取り込み、移植可能に、高度に、かつ役割分担できる形で表現する (Ingress より更に柔軟なもの)
+    - データパスは Ingress とほぼ同じ形
+      - 外部 →（Gateway実装が公開した入口：LB/NodePort/hostNetwork等）→ Gateway実装のPod（L7/L4処理）→ backend Service（ClusterIP）→ kube-proxy等 で Endpoint Podへ
+    - K8s リソース
+      - GatewayClass / Gateway / Routes / Backend
+- DNS
+  - Kubernetes API（Service/EndpointSlice等）を見て、クラスタDNS（多くは CoreDNS）がレコードを自動生成する
+    - 通常Serviceは DNS が VIP（ClusterIP）を返し、実際の分配は kube-proxy 等で起きることになる
+    - 例外: Headless Serivice: DNS が直接 Endpoint（Pod IP群）を返し、その中からクライアント側が適当に選ぶ
+  - 各Podの /etc/resolv.conf は kubelet が設定し、Pod内アプリは IPを知らずに Service 名で引ける状態になる
+    - 例:
+      - `svcname.namespace.svc.cluster.local` → Service の ClusterIP（VIP）を返す
+      - 同一namespace内の Service：`svcname` や `svcname.namespace` で引ける（検索サフィックスが効く）
+- NetworkPolicy
+  - 「どのPodが、どのPod/外部へ、どの方向（ingress/egress）に通信してよいか」を、ラベルセレクタ等で宣言するKubernetesリソース
+  - 実体はただの宣言で、その実行には CNI 実装が必要
+  - コントロールプレーン：NetworkPolicy（宣言）
+  - データプレーン：CNI実装（iptables/nftables/eBPF等）
+    - Pod の veth/eth0 など Pod への通信の直前・直後を制御点として、iptables や eBPF 等により実装
+  - ポリシー
+    - 何もNetworkPolicyが無い場合: 多くのCNIで全許可がデフォルト（クラスタ設計の原則としてPod-to-Pod到達性があるため）
+    - NetworkPolicyがある場合: そのPodについては「(その方向について) 書かれたもの以外は拒否」が基本になる
+  - キー
+    - 対象Pod: podSelector
+      - 注: あくまで pod であって、service ではない
+        - Serviceは DNS 解決でき、ServiceのVIPへもパケットは届く (kube-proxyの変換も起きる) 場合でも最終到達Pod側のIngressが拒否していれば通らないことになる
+    - 方向: policyTypes（Ingress / Egress）
+    - 許可ルール: ingress/from と egress/to
