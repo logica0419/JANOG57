@@ -94,7 +94,7 @@ Kubernetes の完全なネットワーク寄りの解釈をここにまとめた
   - CNI の IPAM
     - CNI は Pod の IPAM も担う
     - 典型は「NodeごとにPod CIDRを割り当て、そこからPod IPを配る」モデル
-      - これは上記で説明した Node 間の配線方式のルーティング型 ([Linux Network#6989dd470000000000be7eaa]) とも相性が良い
+      - これは上記で説明した Node 間の配線方式のルーティング型とも相性が良い
   - kube-proxy との責務の境界
     - CNIは主に「Pod IPの到達性（Pod-to-Pod）」を成立させる
     - 一方、Service の ClusterIP→Endpoint分配は、kube-proxyがNode上にルールを作って実現するのが基本
