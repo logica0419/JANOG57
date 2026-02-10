@@ -17,7 +17,6 @@
   - Pod
   - Deployment
   - Service
-  - Gateway API
 - Kubernetesはコンテナだけど「コンテナだけ」じゃない
   - ワークロードの管理者、形態は関係ない
   - Reconciliation Loop
@@ -122,18 +121,6 @@ Pod - 外部 の通信は、netfilterのSNAT (masquerade) で実装されるこ�
 - 実装方式
   - これまで: デフォルトはiptables
   - これから: デフォルトがnftablesへ
-
-## Ingress通信用 L7LB: Gateway API Controller
-
-- 外部から受けるHTTPトラフィックの、L7ロードバランサー
-  - Webアプリケーション用に作られた基盤なので、これがあらかじめ考慮されている
-- Gateway APIとGateway API Controller
-  - Gateway APIとしてKubernetesに設定を登録
-  - Gateway API Controllerが設定を読み取り、実際にトラフィックをロードバランス
-- Gateway API Controller
-  - 一般的なHTTPリバースプロキシが、Kubernetesから設定を読み取る機能を備えた物
-  - Kubernetesはデフォルトを提供していない
-  - 代表例: NGINX Gateway Fabric, Envoy Gateway, AWS Load Balancer Controller, Google Kubernetes Engine
 
 ### 実装例の紹介
 
