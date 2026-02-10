@@ -155,3 +155,32 @@ Pod - 外部 の通信は、netfilterのSNAT (masquerade) で実装されるこ�
 ## まとめ
 
 ネットワークとの「フラっと」な対話で共にスケールする基盤を！
+
+---
+
+話したい内容一覧
+
+- CNI の責務と kube-proxy の責務
+  - CNI
+    - NAT なしの pod 間通信を成立させる
+    - Pod の IPAM も担う
+  - kube-proxy
+    - Service (仮想のIP)→ Pod の IP への変換を実現させる
+- CNI の責務
+  - node 内 pod-to-pod
+    - bridge型
+    - routed型
+    - eBPF datapath型
+  - node 間 pod-to-pod
+    - underlay routing 型
+    - overlay 型
+- 仕様の範疇ではないが追加で必要になるケースのある責務
+  - network policy
+    - デフォルトでは pod-to-pod に制限をかけないが、network policy リソースへの対応は CNI の責務になる
+  - kube-proxy
+    - 例えば cilium は CNI の実装に eBPF を用いるが、kube-proxy でも eBPF を用いる実装がある (衝突する)
+    - cilium は kubernetes を取り巻くネットワークスタックを全て eBPF で高速化するために、kube-proxy の機能も eBPF で実装して取り込んだ
+      - ≒ cilium は CNI ではなく Network Solution と名乗っている
+
+- 既存の CNI (OSS) と CNI 自前用意の例
+- 自前の CNI を用意したいインセンティブ
